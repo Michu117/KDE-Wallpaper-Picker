@@ -379,6 +379,9 @@ class CarouselWidget(QWidget):
             return ""
         return self._thumb_paths[self._index]
 
+    def item_count(self) -> int:
+        return len(self._paths)
+
     @pyqtProperty(float)
     def offset(self):
         return self._offset
@@ -934,7 +937,7 @@ class WallpaperPickerWindow(QWidget):
             return
 
         name = self._categories[self._cat_index][0]
-        item_count = len(self._categories[self._cat_index][1])
+        item_count = self._carousel.item_count()
         page_count = max(1, (item_count + PAGE_SIZE - 1) // PAGE_SIZE)
         current_page = min(page_count, self._carousel._index // PAGE_SIZE + 1)
         search_label = f"  |  Search: {self._search_query}" if self._search_active or self._search_query else ""
