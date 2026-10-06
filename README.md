@@ -12,10 +12,16 @@ Press a shortcut — a frosted-glass CoverFlow window appears in the center of y
 - **CoverFlow carousel** with smooth 200ms animations
 - **Category support** — organizes wallpapers by subfolder, switch with ↑/↓
 - **Daemon mode** — starts once, opens/closes instantly via shortcut
-- **Thumbnail cache** at `/tmp/wp_thumbs/` — instant display after first launch
+- **Thumbnail cache** at `~/.cache/wallpaper-picker/thumbnails/` — instant display after first launch
 - **Auto-reload** — new wallpapers in your folder are detected automatically
+- **Live wallpapers** — previews and applies local live backgrounds through the KDE plugin
 - **All monitors** are set simultaneously
-- **State persistence** — remembers your last used category
+- **State persistence** — remembers your last category and applied wallpaper
+- **Hidden startup** — starts as a background daemon after login
+- **Large collections** — use `PageUp` and `PageDown` to jump 24 items
+- **Media filters** — press `A` for all, `S` for static, `D` for live, or `Z` for favorites
+- **Search** — press `/` and type a filename fragment
+- **Favorites** — press `F` to save or remove the selected item
 
 ---
 
@@ -24,12 +30,17 @@ Press a shortcut — a frosted-glass CoverFlow window appears in the center of y
 - KDE Plasma (Wayland or X11)
 - Python 3.10+
 - PyQt6
+- `ffmpeg` for video thumbnails
+- **Smart Video Wallpaper Reborn** Plasma wallpaper plugin for video playback
 
 ```bash
-sudo pacman -S python-pyqt6
+sudo dnf install python3-qt6 plasma-workspace ffmpeg
 ```
 
 `plasma-apply-wallpaperimage` is included with KDE Plasma.
+`install.sh` installs **Smart Video Wallpaper Reborn** automatically for the
+current user when it is missing. It downloads the official release and checks
+its SHA-256 before installing it.
 
 ---
 
@@ -41,7 +52,8 @@ cd wallpaper-picker
 bash install.sh
 ```
 
-The script checks dependencies and sets up **autostart** (daemon launches automatically on KDE login).
+The script checks dependencies, installs the Live wallpaper plugin when needed,
+and sets up **autostart** (daemon launches automatically on KDE login).
 
 ---
 
@@ -54,14 +66,14 @@ One manual step required:
 3. Settings:
    - **Name:** `Wallpaper Picker`
    - **Trigger:** `Shift+Alt+W` (or whatever you prefer)
-   - **Action:** `python "/PATH/TO/wallpaper_picker.py"`
+   - **Action:** `python3 "/PATH/TO/wallpaper_picker.py"`
 
 ---
 
 ## Start Without Restarting
 
 ```bash
-python "/PATH/TO/wallpaper_picker.py" &
+python3 "/PATH/TO/wallpaper_picker.py" &
 ```
 
 The shortcut works immediately after.
@@ -73,6 +85,14 @@ The shortcut works immediately after.
 | Key / Action | Function |
 |---|---|
 | `←` / `→` | Previous / next wallpaper |
+| `PageUp` / `PageDown` | Jump 24 wallpapers |
+| `A` | Show all media |
+| `S` | Show static only |
+| `D` | Show live only |
+| `Z` | Show favorites only |
+| `/` | Start filename search |
+| `Backspace` | Remove the last search character |
+| `F` | Toggle favorite |
 | Scroll wheel | Navigate |
 | `↑` / `↓` | Previous / next category |
 | `Enter` | Apply wallpaper + close |
@@ -102,11 +122,16 @@ If no subfolders exist, all images are shown in a single "All" category.
 
 ## Configuration
 
-Edit the top of `wallpaper_picker.py`:
+The default wallpaper directory is `~/wallpapers`. To use another directory, set
+`WALLPAPER_DIR` before starting the picker:
+
+```bash
+WALLPAPER_DIR="$HOME/Imágenes/Fondos" python3 "/PATH/TO/wallpaper_picker.py"
+```
+
+Other display settings can be edited at the top of `wallpaper_picker.py`:
 
 ```python
-WALLPAPER_DIR = Path("/home/YOUR_USER/wallpapers")  # your wallpaper folder
-THUMB_CACHE_DIR = Path("/tmp/wp_thumbs")             # thumbnail cache
 BASE_W, BASE_H = 350, 220                            # center image size
 SPREAD = 230                                         # spacing between images
 BLUR_RADIUS = 30                                     # frosted glass blur strength
@@ -117,7 +142,8 @@ BLUR_OVERLAY_ALPHA = 100                             # dark overlay opacity (0�
 
 ## Supported Formats
 
-`.jpg` `.jpeg` `.png` `.webp` `.bmp`
+`.jpg` `.jpeg` `.png` `.webp` `.bmp` `.mp4` `.mpg` `.mpeg` `.ogg` `.mov` `.webm`
+`.flv` `.mkv` `.avi` `.wmv` `.gif`
 
 ---
 
