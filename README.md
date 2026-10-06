@@ -34,7 +34,7 @@ Press a shortcut — a frosted-glass CoverFlow window appears in the center of y
 - **Smart Video Wallpaper Reborn** Plasma wallpaper plugin for video playback
 
 ```bash
-sudo dnf install python3-qt6 plasma-workspace ffmpeg
+sudo dnf install python3-qt6 plasma-workspace ffmpeg curl glib2
 ```
 
 `plasma-apply-wallpaperimage` is included with KDE Plasma.
@@ -44,13 +44,43 @@ its SHA-256 before installing it.
 
 ---
 
-## Installation
+## Easy installation
+
+On Nobara with KDE Plasma, run:
 
 ```bash
-git clone https://github.com/Xzzz0/KDE-Wallpaper-Picker
-cd wallpaper-picker
+sudo dnf install python3-qt6 plasma-workspace ffmpeg curl glib2
+git clone https://github.com/Michu117/KDE-Wallpaper-Picker.git
+cd KDE-Wallpaper-Picker
+bash install.sh
+mkdir -p ~/wallpapers
+```
+
+The installer checks the dependencies, installs **Smart Video Wallpaper Reborn**
+for the current user when needed, verifies its SHA-256 checksum, and creates a
+hidden **autostart** daemon entry. The picker starts automatically at the next
+KDE login.
+
+To start it immediately without logging out:
+
+```bash
+python3 "$PWD/wallpaper_picker.py" &
+```
+
+Place static and Live backgrounds in `~/wallpapers`. Subfolders become
+categories automatically.
+
+If the project is already cloned, only run:
+
+```bash
+cd KDE-Wallpaper-Picker
 bash install.sh
 ```
+
+The installer is safe to run again and does not reinstall the Live plugin when
+it is already available.
+
+## Installation details
 
 The script checks dependencies, installs the Live wallpaper plugin when needed,
 and sets up **autostart** (daemon launches automatically on KDE login).
