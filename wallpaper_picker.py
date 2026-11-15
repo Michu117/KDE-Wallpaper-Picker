@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Wallpaper Picker — KDE Plasma daemon with CoverFlow carousel and categories."""
 
+import argparse
 import hashlib as _hl
 import json
 import math as _m
@@ -11,6 +12,13 @@ import sys
 import socket
 import subprocess
 import threading
+import time
+from collections import OrderedDict
+
+try:
+    import tomllib  # Python 3.11+
+except ImportError:  # pragma: no cover
+    tomllib = None
 from pathlib import Path
 
 from PyQt6.QtWidgets import QApplication, QWidget, QGraphicsScene, QGraphicsBlurEffect
@@ -18,28 +26,77 @@ from PyQt6.QtCore import (
     Qt, QPropertyAnimation, QEasingCurve, pyqtProperty,
     QFileSystemWatcher, QThread, pyqtSignal, pyqtSlot, QObject, QRectF, QTimer, QEvent
 )
-from PyQt6.QtGui import QPixmap, QPainter, QTransform, QColor, QImage, QFont, QPainterPath
+from PyQt6.QtGui import (
+    QPixmap, QPainter, QColor, QImage, QFont, QPainterPath, QCursor, QGuiApplication,
+)
 
-WALLPAPER_DIR = Path(os.environ.get("WALLPAPER_DIR", str(Path.home() / "wallpapers")))
+CONFIG_DIR = Path.home() / ".config" / "wallpaper-picker"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+
+
+def _load_config(path: Path = CONFIG_FILE) -> dict:
+    """Read the optional TOML config; any problem falls back to defaults."""
+    if tomllib is None:
+        return {}
+    try:
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        print(f"wallpaper-picker: ignoring {path}: {exc}", file=sys.stderr)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _cfg_num(cfg: dict, key: str, default, lo, hi):
+    """Numeric option of the same type as default, clamped to [lo, hi]."""
+    value = cfg.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    if isinstance(default, int):
+        value = int(value)
+    return max(lo, min(hi, value))
+
+
+def _cfg_choice(cfg: dict, key: str, default: str, choices: set) -> str:
+    value = cfg.get(key, default)
+    return value if value in choices else default
+
+
+_CFG = _load_config()
+WALLPAPER_DIR = Path(os.environ.get("WALLPAPER_DIR") or os.path.expanduser(
+    str(_CFG.get("wallpaper_dir", "~/wallpapers"))
+))
 THUMB_CACHE_DIR = Path(os.environ.get(
     "XDG_CACHE_HOME", str(Path.home() / ".cache")
 )) / "wallpaper-picker" / "thumbnails"
 SOCKET_PATH = Path(os.environ.get(
     "XDG_RUNTIME_DIR", f"/tmp/user-{os.getuid()}"
 )) / "wallpaper_picker.sock"
-STATE_FILE = Path.home() / ".config" / "wallpaper-picker" / "state.json"
-BASE_W, BASE_H = 350, 220
-SPREAD = 230
+STATE_FILE = CONFIG_DIR / "state.json"
+BASE_W = _cfg_num(_CFG, "thumb_width", 350, 100, 1000)
+BASE_H = _cfg_num(_CFG, "thumb_height", 220, 60, 700)
+SPREAD = _cfg_num(_CFG, "spread", 230, 50, 1000)
 MAX_DIST = 3.0
-PAGE_SIZE = 24
+PAGE_SIZE = _cfg_num(_CFG, "page_size", 24, 1, 1000)
+ROTATE_MINUTES = _cfg_num(_CFG, "rotate_minutes", 0, 0, 7 * 24 * 60)  # 0 = off
+ROTATE_SOURCE = _cfg_choice(_CFG, "rotate_source", "all", {"all", "favorites"})
 FILTER_ALL = 'all'
 FILTER_IMAGES = 'images'
 FILTER_VIDEOS = 'videos'
 FILTER_FAVORITES = 'favorites'
 HEADER_H = 50
-WIN_W, WIN_H = 1100, 340
-BLUR_RADIUS = 30
-BLUR_OVERLAY_ALPHA = 100  # dark overlay on top of blurred bg
+WIN_W = _cfg_num(_CFG, "window_width", 1100, 400, 4000)
+WIN_H = BASE_H + 120
+BLUR_RADIUS = _cfg_num(_CFG, "blur_radius", 30, 0, 200)
+BLUR_SCALE = _cfg_num(_CFG, "blur_scale", 0.25, 0.05, 1.0)  # blur small, then upscale
+PIXMAP_CACHE_SIZE = 128
+RELOAD_DEBOUNCE_MS = 800   # wait for a burst of file events to settle
+RETRY_MS = 3000            # re-check files that were still being written
+MAX_RETRIES = 10           # give up on a file that never becomes readable
+SETTLE_SECONDS = 5         # files modified more recently may still be copying
+BLUR_OVERLAY_ALPHA = _cfg_num(_CFG, "overlay_alpha", 100, 0, 255)  # dark overlay on blur
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
 VIDEO_EXTENSIONS = {'.mp4', '.mpg', '.mpeg', '.ogg', '.mov', '.webm', '.flv',
                     '.mkv', '.avi', '.wmv', '.gif'}
@@ -68,7 +125,9 @@ def _load_state_data() -> dict:
 
 def _write_state(data: dict):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(data))
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, STATE_FILE)
 
 
 def _save_state(category: str):
@@ -116,6 +175,108 @@ def _save_favorites(favorites: set):
     _write_state(data)
 
 
+def _thumb_path_for(media_path: Path) -> Path:
+    """Unique cache path per media file (full path + extension are hashed)."""
+    key = f"{media_path.resolve()}|{BASE_W}x{BASE_H}"
+    digest = _hl.sha1(key.encode()).hexdigest()
+    return THUMB_CACHE_DIR / f"{digest}.png"
+
+
+def _is_media(path: Path) -> bool:
+    return path.suffix.lower() in MEDIA_EXTENSIONS
+
+
+def _scan_media(directory: Path, interrupted=lambda: False):
+    """Walk directory recursively, skipping hidden folders.
+
+    Returns ({category: [Path, ...]}, has_subdirs). Files directly in the
+    root use the key ""; nested folders use their relative path ("a/b").
+    """
+    groups = {}
+    has_subdirs = False
+    for dirpath, dirnames, filenames in os.walk(directory):
+        if interrupted():
+            break
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith('.'))
+        rel = Path(dirpath).relative_to(directory)
+        key = "" if rel == Path('.') else rel.as_posix()
+        if key == "" and dirnames:
+            has_subdirs = True
+        files = sorted(Path(dirpath) / f for f in filenames if _is_media(Path(f)))
+        if files:
+            groups[key] = files
+    return groups, has_subdirs
+
+
+def _list_media_dirs(directory: Path) -> list:
+    """Directory plus every non-hidden subfolder, at any depth."""
+    if not directory.is_dir():
+        return []
+    dirs = []
+    for dirpath, dirnames, _ in os.walk(directory):
+        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+        dirs.append(dirpath)
+    return dirs
+
+
+def _pick_random(paths: list, current: str = "", only: set | None = None) -> str:
+    """Random existing file from paths, avoiding current when possible."""
+    pool = [p for p in paths if (only is None or p in only) and Path(p).is_file()]
+    others = [p for p in pool if p != current]
+    pool = others or pool
+    return _rnd.choice(pool) if pool else ""
+
+
+def _apply_wallpaper(path: str, screen_count: int, wait: bool = False):
+    """Apply image or live wallpaper on all screens without blocking the UI."""
+    if Path(path).suffix.lower() in VIDEO_EXTENSIONS:
+        if wait:
+            _apply_video_wallpaper(path, screen_count)
+        else:
+            threading.Thread(target=_apply_video_wallpaper,
+                             args=(path, screen_count), daemon=True).start()
+    elif wait:
+        subprocess.run(["plasma-apply-wallpaperimage", path], check=False)
+    else:
+        subprocess.Popen(["plasma-apply-wallpaperimage", path])
+
+
+def _apply_video_wallpaper(path: str, screen_count: int):
+    """May run in a worker thread; must not touch Qt objects."""
+    if shutil.which('gdbus') is None:
+        return
+    video_config = json.dumps([{
+        "filename": path,
+        "enabled": True,
+        "duration": 0,
+        "customDuration": 0,
+        "playbackRate": 0.0,
+        "alternativePlaybackRate": 0.0,
+        "loop": False,
+    }], separators=(',', ':'))
+    parameters = (
+        "{'VideoUrls': <'" + video_config.replace('\\', '\\\\').replace("'", "\\'")
+        + "'>, 'LastVideo': <'" + path.replace('\\', '\\\\').replace("'", "\\'")
+        + "'>, 'ResumeLastVideo': <true>}"
+    )
+    for screen_number in range(screen_count):
+        try:
+            subprocess.run(
+                [
+                    'gdbus', 'call', '--session', '--dest', 'org.kde.plasmashell',
+                    '--object-path', '/PlasmaShell', '--method',
+                    'org.kde.PlasmaShell.setWallpaper',
+                    VIDEO_WALLPAPER_PLUGIN, parameters, str(screen_number),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+
 class _ThumbThread(QThread):
     partial = pyqtSignal(dict)  # cached-only, emitted immediately on start
     done = pyqtSignal(dict)     # full result after generating missing thumbs
@@ -123,38 +284,41 @@ class _ThumbThread(QThread):
     def __init__(self, directory: Path):
         super().__init__()
         self.directory = directory
+        # Files that could not be read or were modified moments ago: they may
+        # still be copying. Read by the loader after the thread finishes.
+        self.unsettled: list = []
+
+    def _note_if_unsettled(self, path: Path, failed: bool = False):
+        try:
+            recent = time.time() - path.stat().st_mtime < SETTLE_SECONDS
+        except OSError:
+            return  # deleted meanwhile
+        if failed or recent:
+            self.unsettled.append(str(path))
 
     def run(self):
         THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-        try:
-            entries = list(self.directory.iterdir())
-        except FileNotFoundError:
+        groups, has_subdirs = _scan_media(self.directory, self.isInterruptionRequested)
+        if self.isInterruptionRequested():
+            return
+        if not groups:
             self.done.emit({})
             return
 
-        subdirs = sorted(e for e in entries if e.is_dir() and not e.name.startswith('.'))
-        root_files = sorted(e for e in entries
-                            if e.is_file() and e.suffix.lower() in MEDIA_EXTENSIONS)
-
-        subdir_cached = {}   # name -> (orig_list, thumb_list) for already-cached
-        subdir_pending = {}  # name -> [Path, ...] needing generation
-
-        for subdir in subdirs:
+        subdir_cached = {}   # category -> (orig_list, thumb_list) already cached
+        subdir_pending = {}  # category -> [Path, ...] needing generation
+        root_files = groups.pop("", [])
+        for name, files in groups.items():
             if self.isInterruptionRequested():
                 return
-            try:
-                files = sorted(p for p in subdir.iterdir()
-                               if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS)
-            except PermissionError:
-                continue
             c_o, c_t, pending = self._split(files)
-            subdir_cached[subdir.name] = (c_o, c_t)
-            subdir_pending[subdir.name] = pending
+            subdir_cached[name] = (c_o, c_t)
+            subdir_pending[name] = pending
 
         root_c_o, root_c_t, root_pending = self._split(root_files)
 
-        partial = self._assemble(subdir_cached, root_c_o, root_c_t, bool(subdirs))
+        partial = self._assemble(subdir_cached, root_c_o, root_c_t, has_subdirs)
         if partial:
             self.partial.emit(partial)
 
@@ -169,17 +333,35 @@ class _ThumbThread(QThread):
         root_c_o += new_root_o
         root_c_t += new_root_t
 
-        self.done.emit(self._assemble(subdir_cached, root_c_o, root_c_t, bool(subdirs)))
+        result = self._assemble(subdir_cached, root_c_o, root_c_t, has_subdirs)
+        if not self.isInterruptionRequested():
+            self._remove_stale_thumbs(result)
+        self.done.emit(result)
+
+    @staticmethod
+    def _remove_stale_thumbs(result: dict):
+        """Delete cached thumbnails whose media file no longer exists."""
+        keep = {t for _, thumbs in result.values() for t in thumbs}
+        try:
+            for thumb in THUMB_CACHE_DIR.glob('*.png'):
+                if str(thumb) not in keep:
+                    thumb.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _split(self, files):
         cached_o, cached_t, pending = [], [], []
         for img_path in files:
             if self.isInterruptionRequested():
                 return cached_o, cached_t, pending + files[len(cached_o) + len(pending):]
-            thumb_name = f"{img_path.parent.name}__{img_path.stem}_thumb.png"
-            thumb_path = THUMB_CACHE_DIR / thumb_name
-            if (thumb_path.exists()
-                    and thumb_path.stat().st_mtime_ns >= img_path.stat().st_mtime_ns):
+            thumb_path = _thumb_path_for(img_path)
+            try:
+                fresh = (thumb_path.exists()
+                         and thumb_path.stat().st_mtime_ns >= img_path.stat().st_mtime_ns)
+            except OSError:  # file removed between the scan and now
+                continue
+            if fresh:
+                self._note_if_unsettled(img_path)
                 cached_o.append(str(img_path))
                 cached_t.append(str(thumb_path))
             else:
@@ -191,14 +373,15 @@ class _ThumbThread(QThread):
         for img_path in files:
             if self.isInterruptionRequested():
                 break
-            thumb_name = f"{img_path.parent.name}__{img_path.stem}_thumb.png"
-            thumb_path = THUMB_CACHE_DIR / thumb_name
+            thumb_path = _thumb_path_for(img_path)
             if img_path.suffix.lower() in VIDEO_EXTENSIONS:
                 if not self._generate_video_thumb(img_path, thumb_path):
+                    self._note_if_unsettled(img_path, failed=True)
                     continue
             else:
                 img = QImage(str(img_path))
                 if img.isNull():
+                    self._note_if_unsettled(img_path, failed=True)
                     continue
                 scaled = img.scaled(
                     BASE_W, BASE_H,
@@ -206,6 +389,7 @@ class _ThumbThread(QThread):
                     Qt.TransformationMode.SmoothTransformation
                 )
                 scaled.save(str(thumb_path))
+            self._note_if_unsettled(img_path)
             orig.append(str(img_path))
             thumbs.append(str(thumb_path))
         return orig, thumbs
@@ -214,10 +398,20 @@ class _ThumbThread(QThread):
     def _generate_video_thumb(video_path: Path, thumb_path: Path) -> bool:
         if shutil.which('ffmpeg') is None:
             return False
+        # The first frame is often black; try 1s in, fall back to the start
+        # for clips shorter than that.
+        for seek in ('1', '0'):
+            if _ThumbThread._run_ffmpeg_thumb(video_path, thumb_path, seek):
+                return True
+        return False
+
+    @staticmethod
+    def _run_ffmpeg_thumb(video_path: Path, thumb_path: Path, seek: str) -> bool:
+        thumb_path.unlink(missing_ok=True)
         try:
             result = subprocess.run(
                 [
-                    'ffmpeg', '-y', '-ss', '0', '-i', str(video_path),
+                    'ffmpeg', '-y', '-ss', seek, '-i', str(video_path),
                     '-frames:v', '1', '-vf',
                     f'scale={BASE_W}:{BASE_H}:force_original_aspect_ratio=decrease,'
                     f'pad={BASE_W}:{BASE_H}:(ow-iw)/2:(oh-ih)/2',
@@ -257,16 +451,32 @@ class WallpaperLoader(QObject):
         super().__init__()
         self.directory = directory
         self._thread = None
+        self._reload_pending = False
+        self._retries: dict = {}  # unsettled path -> attempts so far
+        self._last_result = None
         self._watcher = QFileSystemWatcher()
-        self._watcher.directoryChanged.connect(self.load)
+        self._watcher.directoryChanged.connect(self.schedule_load)
+        # A file being copied fires directoryChanged once, when it appears;
+        # the rest of its content only shows up as fileChanged.
+        self._watcher.fileChanged.connect(self.schedule_load)
+
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(RELOAD_DEBOUNCE_MS)
+        self._debounce.timeout.connect(self.load)
+
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.setInterval(RETRY_MS)
+        self._retry_timer.timeout.connect(self.load)
+
+    def schedule_load(self, *_):
+        """Coalesce bursts of file-system events into one rescan."""
+        self._debounce.start()
 
     def _update_watched_dirs(self):
-        """Watch root + all subdirectories so new files anywhere are detected."""
-        dirs = [str(self.directory)]
-        try:
-            dirs += [str(p) for p in self.directory.iterdir() if p.is_dir()]
-        except FileNotFoundError:
-            pass
+        """Watch root + all nested subdirectories so new files anywhere are detected."""
+        dirs = _list_media_dirs(self.directory)
         existing = set(self._watcher.directories())
         new = [d for d in dirs if d not in existing]
         if new:
@@ -274,16 +484,57 @@ class WallpaperLoader(QObject):
 
     def load(self):
         if self._thread is not None and self._thread.isRunning():
+            self._reload_pending = True
             return
+        self._reload_pending = False
         self._update_watched_dirs()
         self._thread = _ThumbThread(self.directory)
-        self._thread.partial.connect(self.wallpapers_loaded)
-        self._thread.done.connect(self.wallpapers_loaded)
+        self._thread.partial.connect(self._emit_if_changed)
+        self._thread.done.connect(self._emit_if_changed)
+        self._thread.finished.connect(self._on_thread_finished)
         self._thread.start()
 
+    def _emit_if_changed(self, result: dict):
+        # Retries and rescans-on-open usually find nothing new; skip the
+        # carousel reset in that case.
+        if result != self._last_result:
+            self._last_result = result
+            self.wallpapers_loaded.emit(result)
+
+    def _on_thread_finished(self):
+        if self._thread.isInterruptionRequested():
+            return
+        self._track_unsettled(self._thread.unsettled)
+        if self._reload_pending:
+            self.load()
+
+    def _track_unsettled(self, unsettled: list):
+        """Watch files that may still be copying and re-check them later."""
+        still = set(unsettled)
+        self._retries = {p: n for p, n in self._retries.items() if p in still}
+        retry = []
+        for path in still:
+            attempts = self._retries.get(path, 0)
+            if attempts < MAX_RETRIES:
+                self._retries[path] = attempts + 1
+                retry.append(path)
+
+        watched = set(self._watcher.files())
+        done = [p for p in watched if p not in still]
+        if done:
+            self._watcher.removePaths(done)
+        new = [p for p in retry if p not in watched]
+        if new:
+            self._watcher.addPaths(new)
+        if retry:
+            self._retry_timer.start()
+
     def stop(self):
+        self._debounce.stop()
+        self._retry_timer.stop()
         if self._thread is None or not self._thread.isRunning():
             return
+        self._reload_pending = False
         self._thread.requestInterruption()
         self._thread.wait(2000)
 
@@ -305,11 +556,11 @@ class CarouselWidget(QWidget):
         super().__init__(parent)
         self._thumb_paths: list = []
         self._paths: list = []
-        self._pixmap_cache: dict = {}  # thumb_path -> QPixmap, lazy-loaded
-        self._scaled_pixmap_cache: dict = {}
+        self._pixmap_cache: OrderedDict = OrderedDict()  # thumb_path -> QPixmap (LRU)
         self._index = 0
         self._offset = 0.0
         self._vert_offset = 0.0
+        self._active_path = ""
 
         self._anim = QPropertyAnimation(self, b"offset")
         self._anim.setDuration(200)
@@ -325,17 +576,28 @@ class CarouselWidget(QWidget):
 
     def _get_pixmap(self, i: int) -> QPixmap:
         tp = self._thumb_paths[i]
-        if tp not in self._pixmap_cache:
-            self._pixmap_cache[tp] = QPixmap(tp)
-        return self._pixmap_cache[tp]
+        pm = self._pixmap_cache.get(tp)
+        if pm is None:
+            pm = QPixmap(tp)
+            self._pixmap_cache[tp] = pm
+            if len(self._pixmap_cache) > PIXMAP_CACHE_SIZE:
+                self._pixmap_cache.popitem(last=False)
+        else:
+            self._pixmap_cache.move_to_end(tp)
+        return pm
 
-    def set_wallpapers(self, paths: list, thumb_paths: list, direction: int = 0):
-        """Load new wallpapers. direction: +1 slides in from below, -1 from above."""
+    def set_wallpapers(self, paths: list, thumb_paths: list, direction: int = 0,
+                       select_path: str = ""):
+        """Load new wallpapers. direction: +1 slides in from below, -1 from above.
+
+        select_path keeps that item selected when it is still in the list.
+        """
         self._paths = paths
         self._thumb_paths = thumb_paths
-        self._scaled_pixmap_cache.clear()
-        self._index = 0
-        self._offset = 0.0
+        # Thumbnails may have been regenerated on disk
+        self._pixmap_cache.clear()
+        self._index = paths.index(select_path) if select_path in paths else 0
+        self._offset = float(self._index)
         self._anim.stop()
 
         if direction != 0:
@@ -368,6 +630,27 @@ class CarouselWidget(QWidget):
 
     def navigate_page(self, delta: int):
         self.navigate(delta * PAGE_SIZE)
+
+    def jump_to(self, path: str) -> bool:
+        """Select path immediately (no animation). Returns False if not shown."""
+        if path not in self._paths:
+            return False
+        self._anim.stop()
+        self._index = self._paths.index(path)
+        self._offset = float(self._index)
+        self.update()
+        self.selection_changed.emit()
+        return True
+
+    def navigate_random(self):
+        if len(self._paths) < 2:
+            return
+        choices = [i for i in range(len(self._paths)) if i != self._index]
+        self.navigate(_rnd.choice(choices) - self._index)
+
+    def set_active_path(self, path: str):
+        self._active_path = path
+        self.update()
 
     def selected_path(self) -> str:
         if not self._paths:
@@ -458,15 +741,12 @@ class CarouselWidget(QWidget):
             y = cy - h / 2
             shear = -dist * 0.09 if abs(dist) > 0.05 else 0.0
 
-            cache_key = (self._thumb_paths[i], w, h)
-            scaled_pm = self._scaled_pixmap_cache.get(cache_key)
-            if scaled_pm is None:
-                scaled_pm = self._get_pixmap(i).scaled(
-                    w, h,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation
-                )
-                self._scaled_pixmap_cache[cache_key] = scaled_pm
+            # w/h change every animation frame, so let the painter scale
+            # (SmoothPixmapTransform) instead of creating a new pixmap per frame.
+            pm = self._get_pixmap(i)
+            if pm.isNull():
+                continue
+            target = pm.size().scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio)
 
             painter.save()
             painter.setOpacity(opacity)
@@ -476,7 +756,8 @@ class CarouselWidget(QWidget):
                 painter.translate(x + w / 2, y + h / 2)     # pivot to image center
                 painter.shear(shear, 0)
                 painter.translate(-(x + w / 2), -(y + h / 2))
-            painter.drawPixmap(int(x), int(y), scaled_pm)
+            painter.drawPixmap(QRectF(x, y, target.width(), target.height()),
+                               pm, QRectF(pm.rect()))
             if Path(self._paths[i]).suffix.lower() in VIDEO_EXTENSIONS:
                 badge = QRectF(x + 10, y + 10, 58, 22)
                 painter.setOpacity(min(1.0, opacity + 0.2))
@@ -486,6 +767,19 @@ class CarouselWidget(QWidget):
                 painter.setPen(QColor(255, 255, 255, 230))
                 painter.setFont(QFont('monospace', 9))
                 painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, 'LIVE')
+            if self._paths[i] == self._active_path:
+                painter.setOpacity(opacity)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QColor(120, 200, 255, 230))
+                painter.drawRoundedRect(QRectF(x + 1, y + 1, target.width() - 2,
+                                               target.height() - 2), 4, 4)
+                badge = QRectF(x + target.width() - 78, y + 10, 68, 22)
+                painter.setBrush(QColor(40, 110, 170, 220))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawRoundedRect(badge, 5, 5)
+                painter.setPen(QColor(255, 255, 255, 240))
+                painter.setFont(QFont('monospace', 9))
+                painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, 'ACTIVE')
             painter.restore()
 
         painter.end()
@@ -510,16 +804,11 @@ class WallpaperPickerWindow(QWidget):
         self._arr_rects: dict = {'u': (0, 0, 0, 0), 'd': (0, 0, 0, 0)}
         self._t = 0
         self._fx_timer = QTimer(self)
+        self._fx_timer.setInterval(16)
         self._fx_timer.timeout.connect(self._on_fx_tick)
-        self._fx_timer.start(16)
 
-        total_h = WIN_H + HEADER_H
-        screen = QApplication.primaryScreen().geometry()
-        self.setGeometry(
-            screen.x() + (screen.width() - WIN_W) // 2,
-            screen.y() + (screen.height() - total_h) // 2,
-            WIN_W, total_h
-        )
+        self._target_screen = QApplication.primaryScreen()
+        self._place_on_screen(self._target_screen)
 
         self._carousel = CarouselWidget(self)
         self._carousel.setGeometry(0, HEADER_H, WIN_W, WIN_H)
@@ -535,6 +824,13 @@ class WallpaperPickerWindow(QWidget):
         self._search_query = ""
         self._search_active = False
         self._favorites = _load_favorites()
+        self._help_visible = False
+        self._carousel.set_active_path(_load_last_wallpaper())
+
+        self._rotate_timer = QTimer(self)
+        self._rotate_timer.timeout.connect(self._rotate_wallpaper)
+        if ROTATE_MINUTES > 0:
+            self._rotate_timer.start(int(ROTATE_MINUTES * 60_000))
 
         self._loader = WallpaperLoader(WALLPAPER_DIR)
         self._loader.wallpapers_loaded.connect(self._on_loaded)
@@ -558,8 +854,55 @@ class WallpaperPickerWindow(QWidget):
                 self._cat_index = i
                 break
 
-        self._show_current_category()
+        same_category = (self._categories
+                         and self._categories[self._cat_index][0] == prev_name)
+        self._show_current_category(keep_selection=same_category)
         self.update()
+
+    def _place_on_screen(self, screen):
+        """Center the window on screen (X11; on Wayland KWin chooses placement)."""
+        geo = screen.geometry()
+        total_h = WIN_H + HEADER_H
+        self.setGeometry(
+            geo.x() + (geo.width() - WIN_W) // 2,
+            geo.y() + (geo.height() - total_h) // 2,
+            WIN_W, total_h
+        )
+
+    def _all_paths(self) -> list:
+        for name, paths, _ in self._categories:
+            if name == "All":
+                return paths
+        return []
+
+    def _rotate_wallpaper(self):
+        """Periodic rotation (config: rotate_minutes / rotate_source)."""
+        if self.isVisible():
+            return  # don't change it under the user while they are choosing
+        path = _pick_random(self._all_paths(), _load_last_wallpaper(),
+                            self._favorites if ROTATE_SOURCE == "favorites" else None)
+        if path:
+            self._set_active_wallpaper(path)
+
+    @pyqtSlot()
+    def apply_random(self):
+        path = _pick_random(self._all_paths(), _load_last_wallpaper())
+        if path:
+            self._set_active_wallpaper(path)
+
+    def _set_active_wallpaper(self, path: str):
+        _apply_wallpaper(path, len(QApplication.screens()))
+        _save_last_wallpaper(path)
+        self._carousel.set_active_path(path)
+
+    def _apply_random_from_view(self):
+        """R key: pick a random item from what is shown (category, filter,
+        search) and apply it right away. The picker stays open, so pressing R
+        again re-rolls; Enter or Esc closes it."""
+        self._carousel.navigate_random()
+        path = self._carousel.selected_path()
+        if path:
+            self._set_active_wallpaper(path)
 
     def _filtered_paths(self, paths: list, thumbs: list):
         if self._filter_mode == FILTER_ALL:
@@ -583,13 +926,15 @@ class WallpaperPickerWindow(QWidget):
             ]
         return [path for path, _ in selected], [thumb for _, thumb in selected]
 
-    def _show_current_category(self, direction: int = 0):
+    def _show_current_category(self, direction: int = 0, keep_selection: bool = False):
         if not self._categories:
             self._carousel.set_wallpapers([], [])
             return
         _, paths, thumbs = self._categories[self._cat_index]
         filtered_paths, filtered_thumbs = self._filtered_paths(paths, thumbs)
-        self._carousel.set_wallpapers(filtered_paths, filtered_thumbs, direction=direction)
+        select_path = self._carousel.selected_path() if keep_selection else ""
+        self._carousel.set_wallpapers(filtered_paths, filtered_thumbs,
+                                      direction=direction, select_path=select_path)
 
     def _set_filter(self, filter_mode: str):
         if filter_mode == self._filter_mode:
@@ -667,9 +1012,6 @@ class WallpaperPickerWindow(QWidget):
                 if p['y'] < 8 or p['y'] > h - 8:
                     p['vy'] *= -1; p['y'] = max(8.0, min(float(h - 8), p['y']))
             self.update()
-        elif self._t % 3750 == 1:
-            self._update_blur_for_selection()
-            self.update()
 
     def _init_pts(self):
         self._fade = 0.0
@@ -686,10 +1028,12 @@ class WallpaperPickerWindow(QWidget):
                 'vy': spd * _m.sin(ang),
                 'sz': _rnd.randint(11, 20),
             })
+        self._fx_timer.start()
         self.update()
 
     def _exit_sl(self):
         self._sl = 0
+        self._fx_timer.stop()
         self._nh['u'] = 0; self._nh['d'] = 0
         self._pts = []
         self._carousel.show()
@@ -718,23 +1062,34 @@ class WallpaperPickerWindow(QWidget):
             self._blur_bg = None
             return
 
-        screen = QApplication.primaryScreen().geometry()
-        img = img.scaled(screen.width(), screen.height(),
+        # Work at BLUR_SCALE resolution: blurring is O(pixels), and the result is
+        # soft anyway, so upscaling afterwards is visually indistinguishable.
+        f = BLUR_SCALE
+        screen = (self.screen() or self._target_screen).geometry()
+        img = img.scaled(max(1, int(screen.width() * f)), max(1, int(screen.height() * f)),
                          Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                          Qt.TransformationMode.SmoothTransformation)
 
         geo = self.geometry()
-        pad = BLUR_RADIUS * 2
-        ox = max(0, geo.x() - screen.x() - pad)
-        oy = max(0, geo.y() - screen.y() - pad)
-        cw = min(self.width() + pad * 2, screen.width() - ox)
-        ch = min(self.height() + pad * 2, screen.height() - oy)
+        radius = max(1.0, BLUR_RADIUS * f)
+        pad = int(radius * 2)
+        wx = max(0, int((geo.x() - screen.x()) * f))
+        wy = max(0, int((geo.y() - screen.y()) * f))
+        ww = max(1, int(self.width() * f))
+        wh = max(1, int(self.height() * f))
+        ox = max(0, wx - pad)
+        oy = max(0, wy - pad)
+        cw = min(ww + pad * 2, img.width() - ox)
+        ch = min(wh + pad * 2, img.height() - oy)
+        if cw <= 0 or ch <= 0:
+            self._blur_bg = None
+            return
         padded = img.copy(ox, oy, cw, ch)
 
         scene = QGraphicsScene()
         item = scene.addPixmap(QPixmap.fromImage(padded))
         fx = QGraphicsBlurEffect()
-        fx.setBlurRadius(BLUR_RADIUS)
+        fx.setBlurRadius(radius)
         item.setGraphicsEffect(fx)
 
         blurred = QImage(padded.size(), QImage.Format.Format_ARGB32_Premultiplied)
@@ -743,11 +1098,13 @@ class WallpaperPickerWindow(QWidget):
         scene.render(p)
         p.end()
 
-        # Crop padding back out
-        lpad = geo.x() - screen.x() - ox
-        tpad = geo.y() - screen.y() - oy
-        cropped = blurred.copy(lpad, tpad, self.width(), self.height())
-        self._blur_bg = QPixmap.fromImage(cropped)
+        # Crop padding back out, then upscale to window size
+        cropped = blurred.copy(wx - ox, wy - oy, ww, wh)
+        self._blur_bg = QPixmap.fromImage(cropped.scaled(
+            self.width(), self.height(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -758,9 +1115,11 @@ class WallpaperPickerWindow(QWidget):
         super().hideEvent(event)
         if self._sl == 2:
             self._exit_sl()
+        self._set_help(False)
 
     def shutdown(self):
         self._fx_timer.stop()
+        self._rotate_timer.stop()
         self._blur_update_timer.stop()
         self._loader.stop()
 
@@ -773,65 +1132,45 @@ class WallpaperPickerWindow(QWidget):
         if self.isVisible():
             self.hide()
         else:
+            screen = QGuiApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+            self._target_screen = screen
+            self._place_on_screen(screen)
+            self._carousel.jump_to(_load_last_wallpaper())
+            # Safety net for anything the watcher missed (inotify limits,
+            # folder created later, network drives). Cheap: thumbs are cached.
+            self._loader.load()
             self.show()
             self.raise_()
             self.activateWindow()
 
+    @pyqtSlot()
+    def show_window(self):
+        if not self.isVisible():
+            self.toggle()
+
     def apply_and_close(self):
         path = self._carousel.selected_path()
         if path:
-            self._apply_wallpaper(path)
-            _save_last_wallpaper(path)
+            self._set_active_wallpaper(path)
         self.hide()
-
-    def _apply_wallpaper(self, path: str):
-        if Path(path).suffix.lower() in VIDEO_EXTENSIONS:
-            self._apply_video_wallpaper(path)
-        else:
-            subprocess.Popen(["plasma-apply-wallpaperimage", path])
 
     def restore_last_wallpaper(self):
         path = _load_last_wallpaper()
         if path and Path(path).is_file():
-            self._apply_wallpaper(path)
-
-    @staticmethod
-    def _apply_video_wallpaper(path: str):
-        if shutil.which('gdbus') is None:
-            return
-        video_config = json.dumps([{
-            "filename": path,
-            "enabled": True,
-            "duration": 0,
-            "customDuration": 0,
-            "playbackRate": 0.0,
-            "alternativePlaybackRate": 0.0,
-            "loop": False,
-        }], separators=(',', ':'))
-        parameters = (
-            "{'VideoUrls': <'" + video_config.replace('\\', '\\\\').replace("'", "\\'")
-            + "'>, 'LastVideo': <'" + path.replace('\\', '\\\\').replace("'", "\\'")
-            + "'>, 'ResumeLastVideo': <true>}"
-        )
-        for screen_number in range(len(QApplication.screens())):
-            subprocess.run(
-                [
-                    'gdbus', 'call', '--session', '--dest', 'org.kde.plasmashell',
-                    '--object-path', '/PlasmaShell', '--method',
-                    'org.kde.PlasmaShell.setWallpaper',
-                    VIDEO_WALLPAPER_PLUGIN, parameters, str(screen_number),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=10,
-            )
+            _apply_wallpaper(path, len(QApplication.screens()))
 
     def keyPressEvent(self, event):
         if self._sl == 2:
             self._exit_sl()
             return
         key = event.key()
+        if self._help_visible:
+            self._set_help(False)  # any key closes the help
+            return
+        if not self._search_active and (key in (Qt.Key.Key_Question, Qt.Key.Key_F1)
+                                        or event.text() == '?'):
+            self._set_help(True)
+            return
         if self._search_active:
             if key == Qt.Key.Key_Escape:
                 self._clear_search()
@@ -865,6 +1204,8 @@ class WallpaperPickerWindow(QWidget):
             self._set_filter(FILTER_FAVORITES)
         elif key == Qt.Key.Key_F:
             self._toggle_favorite()
+        elif key == Qt.Key.Key_R:
+            self._apply_random_from_view()
         elif key == Qt.Key.Key_Slash:
             self._search_active = True
             self.update()
@@ -973,6 +1314,54 @@ class WallpaperPickerWindow(QWidget):
         painter.setPen(QColor(255, 255, 255, 150 if can_prev else 35))
         painter.drawText(ux, 0, aw, HEADER_H, Qt.AlignmentFlag.AlignCenter, "↑")
 
+        if self._help_visible:
+            self._paint_help(painter)
+        else:
+            hint = QFont()
+            hint.setPixelSize(11)
+            painter.setFont(hint)
+            painter.setPen(QColor(255, 255, 255, 90))
+            painter.drawText(0, 0, WIN_W - 16, HEADER_H,
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                             "?  help")
+
+    def _set_help(self, visible: bool):
+        # The carousel is a child widget and would paint over the overlay
+        self._help_visible = visible
+        self._carousel.setVisible(not visible and self._sl != 2)
+        self.update()
+
+    _HELP_LINES = [
+        ("← / →", "Previous / next"), ("↑ / ↓", "Previous / next category"),
+        ("PageUp / PageDown", f"Jump {PAGE_SIZE}"), ("R", "Apply random wallpaper"),
+        ("Enter / click", "Apply and close"), ("F", "Toggle favorite"),
+        ("A  S  D  Z", "All / static / live / favorites"), ("/", "Search by name"),
+        ("Esc", "Clear search / close"), ("?  or  F1", "This help"),
+    ]
+
+    def _paint_help(self, painter: QPainter):
+        painter.setOpacity(1.0)
+        painter.setBrush(QColor(10, 10, 10, 225))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRect(0, HEADER_H, self.width(), self.height() - HEADER_H)
+        font = QFont()
+        font.setPixelSize(14)
+        painter.setFont(font)
+        rows = (len(self._HELP_LINES) + 1) // 2
+        col_w = self.width() // 2
+        row_h = 26
+        top = HEADER_H + (self.height() - HEADER_H - rows * row_h) // 2
+        for n, (keys, desc) in enumerate(self._HELP_LINES):
+            col, row = divmod(n, rows)
+            x0 = col * col_w
+            y0 = top + row * row_h
+            painter.setPen(QColor(120, 200, 255, 230))
+            painter.drawText(x0, y0, col_w // 2 - 12, row_h,
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, keys)
+            painter.setPen(QColor(255, 255, 255, 220))
+            painter.drawText(x0 + col_w // 2 + 12, y0, col_w // 2 - 12, row_h,
+                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, desc)
+
     def mousePressEvent(self, event):
         if self._sl != 0 or event.button() != Qt.MouseButton.LeftButton:
             return
@@ -986,12 +1375,24 @@ class WallpaperPickerWindow(QWidget):
                 return
 
 
-def run_client() -> bool:
+CMD_TOGGLE = b'T'
+CMD_RANDOM = b'R'
+
+
+def _parse_command(data: bytes) -> bytes | None:
+    """Key byte followed by an optional command byte (old clients send none)."""
+    if not data or data[:1] != _HK():
+        return None
+    cmd = data[1:2] or CMD_TOGGLE
+    return cmd if cmd in (CMD_TOGGLE, CMD_RANDOM) else None
+
+
+def run_client(command: bytes = CMD_TOGGLE) -> bool:
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(1.0)
         s.connect(str(SOCKET_PATH))
-        s.sendall(_HK())
+        s.sendall(_HK() + command)
         ack = s.recv(1)
         s.close()
         return ack == b'\x01'
@@ -999,10 +1400,20 @@ def run_client() -> bool:
         return False
 
 
-def run_daemon():
-    if not _vi():
-        sys.exit(0)
+def _recv_upto(conn, n: int) -> bytes:
+    data = b''
+    try:
+        while len(data) < n:
+            chunk = conn.recv(n - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except socket.timeout:
+        pass
+    return data
 
+
+def run_daemon(show: bool = False):
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -1016,17 +1427,14 @@ def run_daemon():
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(str(SOCKET_PATH))
         srv.listen(1)
-        _fc = 0
         while True:
             conn, _ = srv.accept()
+            conn.settimeout(0.2)
+            cmd = None
             try:
-                data = conn.recv(1)
-                if data != _HK():
-                    _fc += 1
-                    if _fc >= 3:
-                        os._exit(1)
+                cmd = _parse_command(_recv_upto(conn, 2))
+                if cmd is None:
                     continue
-                _fc = 0
                 conn.sendall(b'\x01')
             except Exception:
                 pass
@@ -1035,17 +1443,57 @@ def run_daemon():
                     conn.close()
                 except Exception:
                     pass
+            if cmd is None:
+                continue
             from PyQt6.QtCore import QMetaObject
-            QMetaObject.invokeMethod(window, "toggle",
-                                     Qt.ConnectionType.QueuedConnection)
+            slot = "apply_random" if cmd == CMD_RANDOM else "toggle"
+            QMetaObject.invokeMethod(window, slot, Qt.ConnectionType.QueuedConnection)
 
     t = threading.Thread(target=_socket_server, daemon=True)
     t.start()
 
     QTimer.singleShot(0, window.restore_last_wallpaper)
+    if show:
+        QTimer.singleShot(0, window.show_window)
     sys.exit(app.exec())
 
 
+def run_random_standalone() -> int:
+    """--random without a running daemon: apply one wallpaper and exit."""
+    app = QApplication(sys.argv)
+    groups, _ = _scan_media(WALLPAPER_DIR)
+    paths = [str(p) for files in groups.values() for p in files]
+    path = _pick_random(paths, _load_last_wallpaper())
+    if not path:
+        print(f"wallpaper-picker: no wallpapers found in {WALLPAPER_DIR}", file=sys.stderr)
+        return 1
+    _apply_wallpaper(path, len(app.screens()), wait=True)
+    _save_last_wallpaper(path)
+    print(path)
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="CoverFlow wallpaper picker daemon for KDE Plasma.",
+        epilog="Without options: toggles the picker if the daemon runs, "
+               "otherwise starts the daemon hidden.",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--show", action="store_true",
+                       help="toggle the picker; start the daemon and show it if needed "
+                            "(use this for the keyboard shortcut)")
+    group.add_argument("--random", action="store_true",
+                       help="apply a random wallpaper and exit")
+    args = parser.parse_args(argv)
+
+    if args.random:
+        if not run_client(CMD_RANDOM):
+            sys.exit(run_random_standalone())
+        return
+    if not run_client(CMD_TOGGLE):
+        run_daemon(show=args.show)
+
+
 if __name__ == "__main__":
-    if not run_client():
-        run_daemon()
+    main()
