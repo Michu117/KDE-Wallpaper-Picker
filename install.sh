@@ -64,21 +64,70 @@ require kpackagetool6 "KDE Plasma 6 (plasma-workspace)"
 require kwriteconfig6 "sudo dnf install kf6-kconfig"
 
 # --- Live wallpaper plugin --------------------------------------------------
-if kpackagetool6 --list --type Plasma/Wallpaper 2>/dev/null | grep -q "$VIDEO_PLUGIN_ID"; then
-    ok "Smart Video Wallpaper Reborn found"
-else
+# Prints the installed plugin version and install path ("<version> <path>").
+plugin_info() {
+    local path
+    path="$(kpackagetool6 --type Plasma/Wallpaper --show "$VIDEO_PLUGIN_ID" 2>/dev/null \
+        | sed -n 's/^ *Path *: *//p')"
+    [ -n "$path" ] || return 1
+    local version
+    version="$("$PYTHON_BIN" -c \
+        'import json, sys; print(json.load(open(sys.argv[1]))["KPlugin"]["Version"])' \
+        "$path/metadata.json" 2>/dev/null)" || version="0"
+    echo "$version $path"
+}
+
+version_lt() {  # true if $1 < $2
+    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]
+}
+
+PLUGIN_ACTION="--install"
+if info="$(plugin_info)"; then
+    installed_version="${info%% *}"
+    installed_path="${info#* }"
+    if version_lt "$installed_version" "$VIDEO_PLUGIN_VERSION"; then
+        # Older versions keep live wallpapers paused during Show Desktop
+        # (Meta+D) until a window is minimized; fixed upstream in 2.15.0.
+        echo "Smart Video Wallpaper Reborn $installed_version is outdated (need $VIDEO_PLUGIN_VERSION)"
+        case "$installed_path" in
+            "$HOME"/*) PLUGIN_ACTION="--upgrade" ;;
+            *) PLUGIN_ACTION="--install" ;;  # system copy: install a newer user copy
+        esac
+    else
+        PLUGIN_ACTION=""
+        ok "Smart Video Wallpaper Reborn $installed_version found"
+    fi
+fi
+
+if [ -n "$PLUGIN_ACTION" ]; then
     require curl "sudo dnf install curl"
     echo "Installing Smart Video Wallpaper Reborn v$VIDEO_PLUGIN_VERSION..."
-    PLUGIN_ARCHIVE="$(mktemp)"
-    trap 'rm -f "$PLUGIN_ARCHIVE"' EXIT
+    WORK_DIR="$(mktemp -d)"
+    trap 'rm -rf "$WORK_DIR"' EXIT
+    # kpackagetool6 detects the archive format by its extension
+    PLUGIN_ARCHIVE="$WORK_DIR/plugin.tar.gz"
     curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
         "$VIDEO_PLUGIN_URL" --output "$PLUGIN_ARCHIVE" \
         || die "could not download the live wallpaper plugin"
     printf '%s  %s\n' "$VIDEO_PLUGIN_SHA256" "$PLUGIN_ARCHIVE" | sha256sum --check --status \
         || die "live wallpaper plugin checksum verification failed"
-    kpackagetool6 --type Plasma/Wallpaper --install "$PLUGIN_ARCHIVE" \
-        || die "could not install the live wallpaper plugin"
-    ok "Live wallpaper plugin installed"
+    # --upgrade removes the installed version before installing the new one,
+    # so a failure would leave no plugin at all. Try the archive in a scratch
+    # package root first; the installed plugin is untouched if that fails.
+    kpackagetool6 --type Plasma/Wallpaper --packageroot "$WORK_DIR/check" \
+        --install "$PLUGIN_ARCHIVE" >/dev/null \
+        || die "the downloaded plugin cannot be installed; your current version was kept"
+    if ! kpackagetool6 --type Plasma/Wallpaper "$PLUGIN_ACTION" "$PLUGIN_ARCHIVE"; then
+        if [ "$PLUGIN_ACTION" = "--upgrade" ] && ! plugin_info >/dev/null; then
+            # The old version is already gone: install the new one directly
+            kpackagetool6 --type Plasma/Wallpaper --install "$PLUGIN_ARCHIVE" \
+                || die "the live wallpaper plugin was removed and could not be reinstalled"
+        else
+            die "could not install the live wallpaper plugin"
+        fi
+    fi
+    ok "Live wallpaper plugin $VIDEO_PLUGIN_VERSION installed"
+    PLUGIN_UPDATED=1
 fi
 
 # --- Wallpaper folder + config ----------------------------------------------
@@ -140,6 +189,11 @@ EOF
 fi
 
 echo ""
+if [ "${PLUGIN_UPDATED:-0}" = 1 ]; then
+    echo "Restart Plasma to load the new live wallpaper plugin (or log out and in):"
+    echo "  systemctl --user restart plasma-plasmashell"
+    echo ""
+fi
 echo "Installation complete. Start the daemon now with:"
 echo "  $PYTHON_BIN \"$SCRIPT\" &"
 echo "Uninstall with: bash \"$SCRIPT_DIR/uninstall.sh\""

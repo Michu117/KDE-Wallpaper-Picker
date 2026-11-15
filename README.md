@@ -203,8 +203,8 @@ The `WALLPAPER_DIR` environment variable overrides `wallpaper_dir`:
 WALLPAPER_DIR="$HOME/Imágenes/Fondos" python3 "/PATH/TO/wallpaper_picker.py"
 ```
 
-On Wayland, KWin decides where the window appears (normally the active
-screen). On X11 it opens centered on the screen under the mouse.
+The picker opens centered on the active screen (on X11, the screen under the
+mouse).
 
 ---
 
@@ -228,7 +228,23 @@ wallpaper-picker/
 ---
 ## Troubleshooting
 
-¯\\_(ツ)\_/¯
+**Opening the picker brings back the windows hidden by Show Desktop (Meta+D).**
+On Wayland the picker uses a layer-shell "dock" surface so KWin keeps Show
+Desktop active. This needs `layer-shell-qt` (installed with Plasma) and the
+distribution's PyQt6 (`python3-qt6`). A PyQt6 installed with pip bundles its own
+Qt; the picker then falls back to a normal window and prints a warning.
+
+**Live wallpaper stays frozen after Show Desktop (Meta+D) until a window is
+minimized.** Smart Video Wallpaper Reborn older than 2.15.0 keeps pausing while
+windows are only hidden by Show Desktop. Run `bash install.sh` again (it upgrades
+outdated versions) and restart Plasma:
+
+```bash
+systemctl --user restart plasma-plasmashell
+```
+
+As a workaround on old versions, set *Pause video* to *Never* in the wallpaper
+settings.
 
 ## License
 
