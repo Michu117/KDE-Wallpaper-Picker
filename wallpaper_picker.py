@@ -2,6 +2,7 @@
 """Wallpaper Picker — KDE Plasma daemon with CoverFlow carousel and categories."""
 
 import argparse
+import ctypes
 import hashlib as _hl
 import json
 import math as _m
@@ -24,7 +25,8 @@ from pathlib import Path
 from PyQt6.QtWidgets import QApplication, QWidget, QGraphicsScene, QGraphicsBlurEffect
 from PyQt6.QtCore import (
     Qt, QPropertyAnimation, QEasingCurve, pyqtProperty,
-    QFileSystemWatcher, QThread, pyqtSignal, pyqtSlot, QObject, QRectF, QTimer, QEvent
+    QFileSystemWatcher, QThread, pyqtSignal, pyqtSlot, QObject, QRectF, QTimer, QEvent,
+    QLibraryInfo,
 )
 from PyQt6.QtGui import (
     QPixmap, QPainter, QColor, QImage, QFont, QPainterPath, QCursor, QGuiApplication,
@@ -275,6 +277,74 @@ def _apply_video_wallpaper(path: str, screen_count: int):
             )
         except (OSError, subprocess.TimeoutExpired):
             continue
+
+
+def _setup_layer_shell(widget: QWidget) -> bool:
+    """Turn widget into a layer-shell surface with the "dock" scope (Wayland).
+
+    KWin leaves Show Desktop mode (Meta+D) as soon as a normal window is
+    shown, which brings every hidden window back. Docks do not end it, and
+    layer-shell also centers the picker on the active screen. There are no
+    Python bindings for LayerShellQt, so the few calls needed go through
+    ctypes. Must run before the widget is first shown. Returns False (and
+    changes nothing) when unavailable: X11, LayerShellQt not installed, or a
+    PyQt build that bundles its own Qt (loading the system library would mix
+    two Qt copies).
+    """
+    if QGuiApplication.platformName() != "wayland":
+        return False
+    qt_libs = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.LibrariesPath))
+    ls_path = qt_libs / "libLayerShellQtInterface.so.6"
+    core_path = qt_libs / "libQt6Core.so.6"
+    if not (ls_path.exists() and core_path.exists()):
+        return False
+    try:
+        from PyQt6 import sip
+        core = ctypes.CDLL(str(core_path))
+        ls = ctypes.CDLL(str(ls_path))
+        void_p = ctypes.c_void_p
+
+        def fn(lib, name, *argtypes, restype=None):
+            f = getattr(lib, name)
+            f.argtypes = list(argtypes)
+            f.restype = restype
+            return f
+
+        get = fn(ls, "_ZN12LayerShellQt6Window3getEP7QWindow", void_p, restype=void_p)
+        widget.winId()  # create the QWindow; the layer surface is made on show
+        layer_window = get(sip.unwrapinstance(widget.windowHandle()))
+        if not layer_window:
+            return False
+
+        # QString("dock") built in place: QString(const QChar *, qsizetype).
+        # It is implicitly shared, so setScope keeps its own reference.
+        scope = "dock"
+        utf16 = (ctypes.c_uint16 * len(scope))(*map(ord, scope))
+        qstring = ctypes.create_string_buffer(64)  # sizeof(QString) is 24
+        fn(core, "_ZN7QStringC1EPK5QCharx", void_p, void_p, ctypes.c_longlong)(
+            qstring, utf16, len(scope))
+        widget._layer_shell_refs = (qstring, utf16)
+
+        cint = ctypes.c_int
+        fn(ls, "_ZN12LayerShellQt6Window8setScopeERK7QString", void_p, void_p)(
+            layer_window, qstring)
+        fn(ls, "_ZN12LayerShellQt6Window8setLayerENS0_5LayerE", void_p, cint)(
+            layer_window, 3)  # LayerOverlay: above full-screen windows too
+        fn(ls, "_ZN12LayerShellQt6Window10setAnchorsE6QFlagsINS0_6AnchorEE", void_p, cint)(
+            layer_window, 0)  # no anchors: centered
+        fn(ls, "_ZN12LayerShellQt6Window24setKeyboardInteractivityENS0_21KeyboardInteractivityE",
+           void_p, cint)(layer_window, 2)  # OnDemand: focused, but can lose focus
+        try:
+            fn(ls, "_ZN12LayerShellQt6Window22setScreenConfigurationENS0_19ScreenConfigurationE",
+               void_p, cint)(layer_window, 1)  # ScreenFromCompositor: active screen
+        except AttributeError:  # older LayerShellQt
+            fn(ls, "_ZN12LayerShellQt6Window26setWantsToBeOnActiveScreenEb",
+               void_p, ctypes.c_bool)(layer_window, True)
+        return True
+    except (OSError, AttributeError, ImportError) as exc:
+        print(f"wallpaper-picker: layer-shell unavailable ({exc}); "
+              "Show Desktop will end when the picker opens", file=sys.stderr)
+        return False
 
 
 class _ThumbThread(QThread):
@@ -796,6 +866,7 @@ class WallpaperPickerWindow(QWidget):
             Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._layer_shell = _setup_layer_shell(self)
         self._blur_bg: QPixmap | None = None
         self._nh = {'u': 0, 'd': 0}  # navigation history
         self._sl = 0                  # 0=normal 2=active
